@@ -1,22 +1,21 @@
 #!/usr/bin/env node
 import http from "http";
-import { z } from "zod";
 import fetch from "node-fetch";
+import { z } from "zod";
 
-// ---------------------
-// ENV CHECK
-// ---------------------
+// -------------------------------
+// ENV VARIABLES
+// -------------------------------
 if (!process.env.VPS_API_BASE) {
-  throw new Error("VPS_API_BASE missing. Set it via Fly secrets.");
+  throw new Error("Missing VPS_API_BASE. Set it with Fly secrets.");
 }
 
 const VPS_API_BASE = process.env.VPS_API_BASE;
 const PORT = process.env.PORT || 8000;
 
-// -------------------------
-// TOOL DEFINITIONS
-// -------------------------
-
+// -------------------------------
+// HELPER: Call VPS API
+// -------------------------------
 async function callVps(path, body) {
   const url = `${VPS_API_BASE}${path}`;
   const res = await fetch(url, {
@@ -27,10 +26,11 @@ async function callVps(path, body) {
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`VPS error HTTP ${res.status}: ${txt}`);
+    throw new Error(`VPS API error ${res.status}: ${txt}`);
   }
 
   const json = await res.json();
+
   if (json.success === false) {
     throw new Error(json.stderr || "VPS returned success=false");
   }
@@ -38,9 +38,12 @@ async function callVps(path, body) {
   return json;
 }
 
+// -------------------------------
+// TOOL DEFINITIONS
+// -------------------------------
 const tools = {
   vps_run_command: {
-    description: "Run shell command via VPS API",
+    description: "Run shell command via VPS REST API",
     schema: {
       cmd: z.string()
     },
@@ -48,31 +51,33 @@ const tools = {
       const r = await callVps("/run", { cmd });
       return {
         type: "text",
-        text: `CMD: ${cmd}\n\nSTDOUT:\n${r.stdout || "[empty]"}\n\nSTDERR:\n${r.stderr || "[empty]"}`
+        text:
+          `Command: ${cmd}\n\n` +
+          `STDOUT:\n${r.stdout || "[empty]"}\n\n` +
+          `STDERR:\n${r.stderr || "[empty]"}`
       };
     }
   },
 
   vps_list_dir: {
-    description: "List directory via VPS API",
+    description: "List directory contents via VPS REST API",
     schema: {
       path: z.string()
     },
     handler: async ({ path }) => {
       const r = await callVps("/ls", { path });
-      const lines = (r.files || [])
+      const listing = (r.files || [])
         .map(f => `${f.type === "dir" ? "[DIR]" : "     "}  ${f.name}`)
         .join("\n");
-
       return {
         type: "text",
-        text: `Listing: ${path}\n\n${lines || "[empty]"}`
+        text: `Directory: ${path}\n\n${listing || "[empty]"}`
       };
     }
   },
 
   vps_read_file: {
-    description: "Read file via VPS",
+    description: "Read file from VPS",
     schema: {
       path: z.string()
     },
@@ -86,7 +91,7 @@ const tools = {
   },
 
   vps_write_file: {
-    description: "Write file via VPS",
+    description: "Write file on VPS",
     schema: {
       path: z.string(),
       content: z.string()
@@ -95,16 +100,17 @@ const tools = {
       const r = await callVps("/write", { path, content });
       return {
         type: "text",
-        text: `Write: ${path}\nSuccess: ${r.success}\n\nSTDOUT:\n${r.stdout || ""}\nSTDERR:\n${r.stderr || ""}`
+        text:
+          `Write to: ${path}\nSuccess: ${r.success}\n\n` +
+          `STDOUT:\n${r.stdout || ""}\n\nSTDERR:\n${r.stderr || ""}`
       };
     }
   }
 };
 
-// -----------------------------
-// MCP HTTP SERVER LOGIC
-// -----------------------------
-
+// -------------------------------
+// MCP JSON-RPC HELPERS
+// -------------------------------
 function sendJSON(res, obj) {
   res.setHeader("Content-Type", "application/json");
   res.writeHead(200);
@@ -116,23 +122,38 @@ function mcpResponse(id, result) {
 }
 
 function mcpError(id, message) {
-  return { jsonrpc: "2.0", id, error: { code: -32000, message } };
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32000, message }
+  };
 }
 
+// -------------------------------
+// HTTP MCP SERVER
+// -------------------------------
 const server = http.createServer(async (req, res) => {
   if (req.method !== "POST" || req.url !== "/mcp") {
     res.writeHead(404);
     return res.end("Not found");
   }
 
-  let body = "";
-  req.on("data", chunk => (body += chunk));
+  let raw = "";
+  req.on("data", chunk => (raw += chunk));
   req.on("end", async () => {
+    let data;
     try {
-      const data = JSON.parse(body);
-      const { id, method, params } = data;
+      data = JSON.parse(raw);
+    } catch {
+      return sendJSON(res, mcpError(null, "Invalid JSON"));
+    }
 
-      // INIT
+    const { id, method, params } = data;
+
+    try {
+      // -----------------------------------
+      // MCP HANDSHAKE
+      // -----------------------------------
       if (method === "initialize") {
         return sendJSON(
           res,
@@ -143,13 +164,19 @@ const server = http.createServer(async (req, res) => {
               version: "1.0.0"
             },
             capabilities: {
-              tools: {}
-            }
+              tools: {
+                list: true,
+                invoke: true
+              }
+            },
+            tools: Object.keys(tools)
           })
         );
       }
 
+      // -----------------------------------
       // LIST TOOLS
+      // -----------------------------------
       if (method === "tools/list") {
         const list = Object.entries(tools).map(([name, t]) => ({
           name,
@@ -157,23 +184,20 @@ const server = http.createServer(async (req, res) => {
           inputSchema: {
             type: "object",
             properties: Object.fromEntries(
-              Object.entries(t.schema.shape).map(([k, v]) => [
-                k,
-                { type: "string" }
-              ])
+              Object.entries(t.schema).map(([k]) => [k, { type: "string" }])
             ),
-            required: Object.keys(t.schema.shape)
+            required: Object.keys(t.schema)
           }
         }));
         return sendJSON(res, mcpResponse(id, { tools: list }));
       }
 
+      // -----------------------------------
       // INVOKE TOOL
+      // -----------------------------------
       if (method === "tools/invoke") {
         const tool = tools[params.name];
-        if (!tool) {
-          return sendJSON(res, mcpError(id, "Unknown tool: " + params.name));
-        }
+        if (!tool) return sendJSON(res, mcpError(id, "Unknown tool: " + params.name));
 
         let validated;
         try {
@@ -182,19 +206,23 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, mcpError(id, "Invalid arguments: " + e.message));
         }
 
-        const out = await tool.handler(validated);
-        return sendJSON(res, mcpResponse(id, { content: [out] }));
+        const output = await tool.handler(validated);
+        return sendJSON(res, mcpResponse(id, { content: [output] }));
       }
 
-      // UNKNOWN CALL
+      // -----------------------------------
+      // UNKNOWN METHOD
+      // -----------------------------------
       return sendJSON(res, mcpError(id, "Unknown method: " + method));
     } catch (err) {
-      return sendJSON(res, { jsonrpc: "2.0", error: { code: -32001, message: err.message } });
+      return sendJSON(res, mcpError(id, err.message));
     }
   });
 });
 
-// Start listening
+// -------------------------------
+// START SERVER
+// -------------------------------
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`MCP HTTP server running on port ${PORT} at /mcp`);
+  console.log(`✔ MCP HTTP server running on port ${PORT} at /mcp`);
 });
