@@ -1,162 +1,200 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { HttpServerTransport } from "@modelcontextprotocol/sdk/server/http.js";
+import http from "http";
 import { z } from "zod";
 import fetch from "node-fetch";
 
-// Require VPS_API_BASE to be provided as environment variable
+// ---------------------
+// ENV CHECK
+// ---------------------
 if (!process.env.VPS_API_BASE) {
-  throw new Error(
-    "Missing VPS_API_BASE environment variable. " +
-    "Set VPS_API_BASE to your VPS REST API URL."
-  );
+  throw new Error("VPS_API_BASE missing. Set it via Fly secrets.");
 }
 
 const VPS_API_BASE = process.env.VPS_API_BASE;
+const PORT = process.env.PORT || 8000;
 
-// Helper: call VPS REST API
+// -------------------------
+// TOOL DEFINITIONS
+// -------------------------
+
 async function callVps(path, body) {
   const url = `${VPS_API_BASE}${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {})
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body ?? {})
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status}: ${text}`);
-    }
-
-    const json = await res.json();
-
-    if (json.success === false) {
-      throw new Error(json.stderr || "VPS returned success=false");
-    }
-
-    return json;
-  } catch (err) {
-    throw new Error(`VPS API error at ${url}: ${err.message}`);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`VPS error HTTP ${res.status}: ${txt}`);
   }
+
+  const json = await res.json();
+  if (json.success === false) {
+    throw new Error(json.stderr || "VPS returned success=false");
+  }
+
+  return json;
 }
 
-// ---------------------------------------------------------------------
-// MCP SERVER
-// ---------------------------------------------------------------------
+const tools = {
+  vps_run_command: {
+    description: "Run shell command via VPS API",
+    schema: {
+      cmd: z.string()
+    },
+    handler: async ({ cmd }) => {
+      const r = await callVps("/run", { cmd });
+      return {
+        type: "text",
+        text: `CMD: ${cmd}\n\nSTDOUT:\n${r.stdout || "[empty]"}\n\nSTDERR:\n${r.stderr || "[empty]"}`
+      };
+    }
+  },
 
-const server = new McpServer({
-  name: "vps-remote",
-  version: "1.0.0"
+  vps_list_dir: {
+    description: "List directory via VPS API",
+    schema: {
+      path: z.string()
+    },
+    handler: async ({ path }) => {
+      const r = await callVps("/ls", { path });
+      const lines = (r.files || [])
+        .map(f => `${f.type === "dir" ? "[DIR]" : "     "}  ${f.name}`)
+        .join("\n");
+
+      return {
+        type: "text",
+        text: `Listing: ${path}\n\n${lines || "[empty]"}`
+      };
+    }
+  },
+
+  vps_read_file: {
+    description: "Read file via VPS",
+    schema: {
+      path: z.string()
+    },
+    handler: async ({ path }) => {
+      const r = await callVps("/read", { path });
+      return {
+        type: "text",
+        text: `File: ${path}\n\n${r.content || ""}`
+      };
+    }
+  },
+
+  vps_write_file: {
+    description: "Write file via VPS",
+    schema: {
+      path: z.string(),
+      content: z.string()
+    },
+    handler: async ({ path, content }) => {
+      const r = await callVps("/write", { path, content });
+      return {
+        type: "text",
+        text: `Write: ${path}\nSuccess: ${r.success}\n\nSTDOUT:\n${r.stdout || ""}\nSTDERR:\n${r.stderr || ""}`
+      };
+    }
+  }
+};
+
+// -----------------------------
+// MCP HTTP SERVER LOGIC
+// -----------------------------
+
+function sendJSON(res, obj) {
+  res.setHeader("Content-Type", "application/json");
+  res.writeHead(200);
+  res.end(JSON.stringify(obj, null, 2));
+}
+
+function mcpResponse(id, result) {
+  return { jsonrpc: "2.0", id, result };
+}
+
+function mcpError(id, message) {
+  return { jsonrpc: "2.0", id, error: { code: -32000, message } };
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method !== "POST" || req.url !== "/mcp") {
+    res.writeHead(404);
+    return res.end("Not found");
+  }
+
+  let body = "";
+  req.on("data", chunk => (body += chunk));
+  req.on("end", async () => {
+    try {
+      const data = JSON.parse(body);
+      const { id, method, params } = data;
+
+      // INIT
+      if (method === "initialize") {
+        return sendJSON(
+          res,
+          mcpResponse(id, {
+            protocolVersion: "1.0",
+            serverInfo: {
+              name: "vps-mcp-server",
+              version: "1.0.0"
+            },
+            capabilities: {
+              tools: {}
+            }
+          })
+        );
+      }
+
+      // LIST TOOLS
+      if (method === "tools/list") {
+        const list = Object.entries(tools).map(([name, t]) => ({
+          name,
+          description: t.description,
+          inputSchema: {
+            type: "object",
+            properties: Object.fromEntries(
+              Object.entries(t.schema.shape).map(([k, v]) => [
+                k,
+                { type: "string" }
+              ])
+            ),
+            required: Object.keys(t.schema.shape)
+          }
+        }));
+        return sendJSON(res, mcpResponse(id, { tools: list }));
+      }
+
+      // INVOKE TOOL
+      if (method === "tools/invoke") {
+        const tool = tools[params.name];
+        if (!tool) {
+          return sendJSON(res, mcpError(id, "Unknown tool: " + params.name));
+        }
+
+        let validated;
+        try {
+          validated = tool.schema.parse(params.arguments);
+        } catch (e) {
+          return sendJSON(res, mcpError(id, "Invalid arguments: " + e.message));
+        }
+
+        const out = await tool.handler(validated);
+        return sendJSON(res, mcpResponse(id, { content: [out] }));
+      }
+
+      // UNKNOWN CALL
+      return sendJSON(res, mcpError(id, "Unknown method: " + method));
+    } catch (err) {
+      return sendJSON(res, { jsonrpc: "2.0", error: { code: -32001, message: err.message } });
+    }
+  });
 });
 
-// 1) Run command
-server.tool(
-  "vps_run_command",
-  "Run a shell command on VPS via /run.",
-  { cmd: z.string().min(1) },
-  async ({ cmd }) => {
-    const result = await callVps("/run", { cmd });
-    const stdout = result.stdout || "";
-    const stderr = result.stderr || "";
-
-    const text =
-      `Command: ${cmd}\n\n` +
-      `--- STDOUT ---\n${stdout || "[empty]"}\n\n` +
-      `--- STDERR ---\n${stderr || "[empty]"}`;
-
-    return { content: [{ type: "text", text }] };
-  }
-);
-
-// 2) List directory
-server.tool(
-  "vps_list_dir",
-  "List files and directories on VPS via /ls.",
-  { path: z.string().min(1) },
-  async ({ path }) => {
-    const result = await callVps("/ls", { path });
-    const files = result.files || [];
-
-    const lines = files.map((f) => {
-      const prefix = f.type === "dir" ? "[DIR]" : "     ";
-      return `${prefix}  ${f.name}`;
-    });
-
-    return {
-      content: [
-        {
-          type: "text",
-          text:
-            `Directory listing for: ${path}\n\n` +
-            (lines.length ? lines.join("\n") : "[empty]")
-        }
-      ]
-    };
-  }
-);
-
-// 3) Read file
-server.tool(
-  "vps_read_file",
-  "Read a file via /read.",
-  { path: z.string().min(1) },
-  async ({ path }) => {
-    const result = await callVps("/read", { path });
-    return {
-      content: [
-        {
-          type: "text",
-          text: `File: ${path}\n\n${result.content ?? ""}`
-        }
-      ]
-    };
-  }
-);
-
-// 4) Write file
-server.tool(
-  "vps_write_file",
-  "Write a file via /write.",
-  {
-    path: z.string().min(1),
-    content: z.string()
-  },
-  async ({ path, content }) => {
-    const result = await callVps("/write", { path, content });
-    const ok = result.success !== false;
-
-    const stdout = result.stdout || "";
-    const stderr = result.stderr || "";
-
-    const text =
-      `Write file: ${path}\n` +
-      `Status: ${ok ? "success" : "failed"}\n\n` +
-      (stdout ? `STDOUT:\n${stdout}\n\n` : "") +
-      (stderr ? `STDERR:\n${stderr}\n` : "");
-
-    return { content: [{ type: "text", text }] };
-  }
-);
-
-// ---------------------------------------------------------------------
-// HTTP SERVER (required by mcphosting)
-// ---------------------------------------------------------------------
-
-const port = process.env.PORT || 8000;
-const endpoint = "/mcp";
-
-const transport = new HttpServerTransport({ path: endpoint });
-
-server
-  .connect(transport)
-  .then(() => {
-    transport.listen(port, () => {
-      console.log(`MCP server running on port ${port} at path ${endpoint}`);
-    });
-  })
-  .catch((err) => {
-    console.error("Failed to start MCP server:", err);
-    process.exit(1);
-  });
+// Start listening
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`MCP HTTP server running on port ${PORT} at /mcp`);
+});
