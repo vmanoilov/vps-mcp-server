@@ -1,24 +1,23 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { HttpServerTransport } from "@modelcontextprotocol/sdk/server/http.js";
 import { z } from "zod";
 import fetch from "node-fetch";
 
-// Require VPS_API_BASE from environment variables only (no fallback).
+// Require VPS_API_BASE to be provided as environment variable
 if (!process.env.VPS_API_BASE) {
   throw new Error(
     "Missing VPS_API_BASE environment variable. " +
-    "Please set VPS_API_BASE to your VPS REST API URL."
+    "Set VPS_API_BASE to your VPS REST API URL."
   );
 }
 
 const VPS_API_BASE = process.env.VPS_API_BASE;
 
-/**
- * Helper to call VPS REST API endpoints
- */
+// Helper: call VPS REST API
 async function callVps(path, body) {
   const url = `${VPS_API_BASE}${path}`;
+
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -32,18 +31,19 @@ async function callVps(path, body) {
     }
 
     const json = await res.json();
+
     if (json.success === false) {
       throw new Error(json.stderr || "VPS returned success=false");
     }
 
     return json;
   } catch (err) {
-    throw new Error(`Error calling VPS API at ${url}: ${err.message}`);
+    throw new Error(`VPS API error at ${url}: ${err.message}`);
   }
 }
 
 // ---------------------------------------------------------------------
-// Create MCP Server
+// MCP SERVER
 // ---------------------------------------------------------------------
 
 const server = new McpServer({
@@ -51,10 +51,10 @@ const server = new McpServer({
   version: "1.0.0"
 });
 
-// 1) Run shell command
+// 1) Run command
 server.tool(
   "vps_run_command",
-  "Run a shell command on your VPS via /run.",
+  "Run a shell command on VPS via /run.",
   { cmd: z.string().min(1) },
   async ({ cmd }) => {
     const result = await callVps("/run", { cmd });
@@ -70,10 +70,10 @@ server.tool(
   }
 );
 
-// 2) Directory listing
+// 2) List directory
 server.tool(
   "vps_list_dir",
-  "List files/directories on VPS via /ls.",
+  "List files and directories on VPS via /ls.",
   { path: z.string().min(1) },
   async ({ path }) => {
     const result = await callVps("/ls", { path });
@@ -84,24 +84,33 @@ server.tool(
       return `${prefix}  ${f.name}`;
     });
 
-    const text =
-      `Directory listing for: ${path}\n\n` +
-      (lines.length ? lines.join("\n") : "[empty]");
-
-    return { content: [{ type: "text", text }] };
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Directory listing for: ${path}\n\n` +
+            (lines.length ? lines.join("\n") : "[empty]")
+        }
+      ]
+    };
   }
 );
 
 // 3) Read file
 server.tool(
   "vps_read_file",
-  "Read file content from VPS via /read.",
+  "Read a file via /read.",
   { path: z.string().min(1) },
   async ({ path }) => {
     const result = await callVps("/read", { path });
-    const content = result.content ?? "";
     return {
-      content: [{ type: "text", text: `File: ${path}\n\n${content}` }]
+      content: [
+        {
+          type: "text",
+          text: `File: ${path}\n\n${result.content ?? ""}`
+        }
+      ]
     };
   }
 );
@@ -109,7 +118,7 @@ server.tool(
 // 4) Write file
 server.tool(
   "vps_write_file",
-  "Write content to a VPS file via /write.",
+  "Write a file via /write.",
   {
     path: z.string().min(1),
     content: z.string()
@@ -131,9 +140,23 @@ server.tool(
   }
 );
 
-// Connect via STDIO (used by mcphosting + local dev)
-const transport = new StdioServerTransport();
-server.connect(transport).catch((err) => {
-  console.error("Failed to start vps-remote MCP server:", err);
-  process.exit(1);
-});
+// ---------------------------------------------------------------------
+// HTTP SERVER (required by mcphosting)
+// ---------------------------------------------------------------------
+
+const port = process.env.PORT || 8000;
+const endpoint = "/mcp";
+
+const transport = new HttpServerTransport({ path: endpoint });
+
+server
+  .connect(transport)
+  .then(() => {
+    transport.listen(port, () => {
+      console.log(`MCP server running on port ${port} at path ${endpoint}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to start MCP server:", err);
+    process.exit(1);
+  });
