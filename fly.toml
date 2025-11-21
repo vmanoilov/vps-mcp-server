@@ -4,17 +4,20 @@
 #
 
 app = 'vps-mcp-server'
-primary_region = 'cdg'
+primary_region = 'ams'
 
 [build]
+  dockerfile = "Dockerfile"
+[env]
+  NODE_ENV = "production"
 
 [http_service]
-  internal_port = 3000
+  internal_port = 8000
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+  min_machines_running = 1
+  processes = ["app"]
 
 [[vm]]
   memory = '1gb'
